@@ -15,14 +15,51 @@ rec {
       hash = dependency.integrity;
     };
 
+
+  parseGitHubRef = str: rec {
+    parts = builtins.split "[:#/]" str;
+    org = builtins.elemAt parts 2;
+    repo = builtins.elemAt parts 4;
+    rev = builtins.elemAt parts 6;
+  };
+
+  # Description: Turns a dependency with a from field of the format
+  # `github:org/repo#revision` into a git fetcher
+  # Type: String -> Set -> Path
+  makeGithubSource = name: dependency:
+    assert !(dependency ? version) ->
+      builtins.throw "Missing `version` attribute missing from `${name}`";
+    assert (lib.hasPrefix "github: " dependency.version) -> builtins.throw "invalid prefix for `version` field of `${name}` expected `github:`, got: `${dependency.version}`.";
+    let
+      v = parseGitHubRef dependency.version;
+      f = parseGitHubRef dependency.from;
+    in
+    assert v.org != f.org -> throw "[npmlock2nix] version and from of `${name}` disagree on the GitHub org to fetch from: `${v.org}` vs `${f.org}`";
+    assert v.repo != f.repo -> throw "[npmlock2nix] version and from of `${name}` disagree on the GitHub repo to fetch from: `${v.repo}` vs `${f.repo}`";
+    let
+      src = builtins.fetchGit ({
+        url = "https://github.com/${v.org}/${v.repo}";
+        inherit (v) rev;
+        ref = v.rev;
+      } // (lib.optionalAttrs (builtins.stringLength f.rev != 7) {
+      }));
+    in
+    lib.traceVal ((builtins.removeAttrs dependency [ "from" ]) // {
+      version = "file:" + (toString src);
+    });
+
   # Description: Turns an npm lockfile dependency into a fetchurl derivation
   # Type: String -> Set -> Derivation
   makeSource = name: dependency:
-    assert (builtins.typeOf name != "string") -> throw "[npmlock2nix] Name of dependency ${toString name} must be a string";
-    assert (builtins.typeOf dependency != "set") -> throw "[npmlock2nix] Specification of dependency ${toString name} must be a set";
+    assert (builtins.typeOf name != "string") ->
+      throw "[npmlock2nix] Name of dependency ${toString name} must be a string";
+    assert (builtins.typeOf dependency != "set") ->
+      throw "[npmlock2nix] Specification of dependency ${toString name} must be a set";
     if dependency ? resolved && dependency ? integrity then
-      fetchurl (makeSourceAttrs name dependency)
-    else throw "[npmlock2nix] A valid dependency consists of at least the resolved and integrity field. Missing one or both of them for `${name}`.";
+      dependency // { resolved = "file://" + (toString (fetchurl (makeSourceAttrs name dependency))); }
+    else if dependency ? from && dependency ? version then
+      makeGithubSource name dependency
+    else throw "[npmlock2nix] A valid dependency consists of at least the resolved and integrity field. Missing one or both of them for `${name}`. The object I got looks like this: ${builtins.toJSON dependency}";
 
   # Description: Parses the lock file as json and returns an attribute set
   # Type: Path -> Set
@@ -31,7 +68,9 @@ rec {
       content = builtins.readFile file;
       json = builtins.fromJSON content;
     in
-    assert builtins.typeOf json != "set" -> throw "[npmlock2nix] The NPM lockfile must be a valid JSON object";
+    assert
+    builtins.typeOf json != "set" ->
+    throw "[npmlock2nix] The NPM lockfile must be a valid JSON object";
     # if a lockfile doesn't declare dependencies ensure that we have an empty
     # set. This makes the consuming code eaiser.
     if json ? dependencies then json else json // { dependencies = { }; };
@@ -40,29 +79,56 @@ rec {
   # Description: Patches a single dependency (recursively) by replacing the resolved URL with a store path
   # Type: String -> Set -> Set
   patchDependency = name: spec:
-    assert (builtins.typeOf name != "string") -> throw "[npmlock2nix] Name of dependency ${toString name} must be a string";
-    assert (builtins.typeOf spec != "set") -> throw "[npmlock2nix] pec of dependency ${toString name} must be a set";
+    assert (builtins.typeOf name != "string") ->
+      throw "[npmlock2nix] Name of dependency ${toString name} must be a string";
+    assert (builtins.typeOf spec != "set") ->
+      throw "[npmlock2nix] pec of dependency ${toString name} must be a set";
     let
       isBundled = spec ? bundled && spec.bundled == true;
     in
-    spec // lib.optionalAttrs (!isBundled) ({
-      resolved = "file://" + (toString (makeSource name spec));
-    }) // lib.optionalAttrs (spec ? dependencies) {
+    lib.optionalAttrs
+      (!isBundled)
+      (makeSource name spec) //
+    lib.optionalAttrs
+      (spec ? dependencies) {
       dependencies = lib.mapAttrs patchDependency spec.dependencies;
     };
 
   # Description: Takes a Path to a lockfile and returns the patched version as attribute set
   # Type: Path -> Set
   patchLockfile = file:
-    assert (builtins.typeOf file != "path" && builtins.typeOf file != "string") -> throw "[npmlock2nix] file ${toString file} must be a path or string";
+    assert (builtins.typeOf file != "path" && builtins.typeOf file != "string") ->
+      throw "[npmlock2nix] file ${toString file} must be a path or string";
     let content = readLockfile file; in
     content // {
       dependencies = lib.mapAttrs patchDependency content.dependencies;
     };
 
-  # Description: Takes a Path to a lockfile and returns the patched version as file in the Nix store
-  # Type: Path -> Derivation
-  patchedLockfile = file: writeText "packages-lock.json" (builtins.toJSON (patchLockfile file));
+  # Description: Rewrite all the `github:` references to store paths
+  # Type: Path -> Set
+  patchPackagefile = lockFile: file:
+    assert (builtins.typeOf file != "path" && builtins.typeOf file != "string") ->
+      throw "[npmlock2nix] file ${toString file} must be a path or string";
+    let content = builtins.fromJSON (builtins.readFile file); in
+    content // {
+      dependencies =
+        lib.mapAttrs
+          (name: version:
+          if lib.hasPrefix "github:" version then
+            lockFile.dependencies.${name}.version
+            else version)
+          content.dependencies;
+    };
+
+  patchedPackagefile = lockfile: file: writeText "package.json"
+    (
+      builtins.toJSON (patchPackagefile lockfile file)
+    );
+
+    # Description: Takes a Path to a lockfile and returns the patched version as file in the Nix store
+    # Type: Path -> Derivation
+    patchedLockfile = file: writeText "packages-lock.json"
+  (builtins.toJSON (patchLockfile file));
 
   # Turn a derivation (with name & src attribute) into a directory containing the unpacked sources
   # Type: Derivation -> Derivation
@@ -113,8 +179,11 @@ rec {
     , preInstallLinks ? { } # set that describes which files should be linked in a specific packages folder
     , ...
     }@args:
-      assert (builtins.typeOf preInstallLinks != "set") -> throw "[npmlock2nix] `preInstallLinks` must be an attributeset of attributesets";
+      assert (builtins.typeOf preInstallLinks != "set") ->
+        throw "[npmlock2nix] `preInstallLinks` must be an attributeset of attributesets";
       let
+
+        cleanArgs = lib.traceVal (builtins.removeAttrs args [ "src" "packageJson" "packageLockJson" "buildInputs" "nativeBuildInputs" "nodejs" "preBuild" "postBuild" "preInstallLinks" ]);
         lockfile = readLockfile packageLockJson;
 
         preinstall_node_modules = writeTextFile {
@@ -169,6 +238,7 @@ rec {
 
         postPatch = ''
           ln -sf ${patchedLockfile packageLockJson} package-lock.json
+          ln -sf ${patchedPackagefile (patchLockfile packageLockJson) packageJson} package-lock.json
         '';
 
         buildPhase = ''
@@ -195,6 +265,8 @@ rec {
 
         passthru = {
           inherit nodejs;
+          lockfile = patchedLockfile packageLockJson;
+          packagesfile = patchedPackagefile (patchLockfile packageLockJson) packageJson;
         };
       };
 
@@ -240,5 +312,7 @@ rec {
         ${lib.concatStringsSep "\n" buildCommands}
         runHook postBuild
       '';
+
+      passthru.node_modules = nm;
     } // extraAttrs);
 }
