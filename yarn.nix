@@ -141,7 +141,7 @@ let
       patchedLockfile = writeText "yarn.lock" (patchFile yarnLockFile);
     in
     stdenv.mkDerivation (args // {
-      pname = packageJson.name;
+      pname = internal.makeSafeName packageJson.name;
       version = packageJson.version;
       inherit src;
 
